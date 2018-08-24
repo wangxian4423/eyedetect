@@ -1,0 +1,174 @@
+#!/usr/bin/env python
+import numpy as np
+import cv2
+#import matplotlib.pyplot as plt
+import h5py
+from scipy.ndimage import filters
+from scipy.linalg import eigh
+from scipy.ndimage.filters import uniform_filter
+from sklearn.neighbors import NearestNeighbors
+import math
+
+
+import rospy
+from std_msgs.msg import Int32MultiArray
+from std_msgs.msg import Float32MultiArray
+from sensor_msgs.msg import Image
+from cv_bridge import CvBridge, CvBridgeError
+
+
+backgroundColorImage= 'color.jpg'
+backgroundDepthImage = 'depth.png'
+cameraIntrinsicsFile = 'asus.txt'
+
+img_height = 540
+img_width = 960
+
+backgroundColor = (cv2.imread( backgroundColorImage, -1 )).astype(np.float32)/ 255
+backgroundDepth = (cv2.imread( backgroundDepthImage, -1 )).astype(np.float32)/ 10000
+cameraIntrinsics = (np.loadtxt(cameraIntrinsicsFile)).astype(np.float32)
+backgroundColor = cv2.cvtColor(backgroundColor, cv2.COLOR_BGR2RGB)
+
+inputColor = np.empty([1,1])
+inputDepth = np.empty([1,1])
+results = np.empty([1,1])
+affordanceMap = np.empty([1,1])
+
+
+def npmax(arr):
+    i = arr.max(1).argmax()
+    j = arr.max(0).argmax()
+    return (i, j)
+
+
+def estimate_normals(pointcloud, x, y, z, num):
+    point = np.array([x, y, z])
+    neigh = NearestNeighbors(num) 
+    neigh.fit(pointcloud)
+    neighbors_pos = neigh.kneighbors([[x, y, z]]) 
+    neighbors = inputPoints2[neighbors_pos[1][0][0:num], 0:3] 
+    average = np.sum(neighbors, axis = 0) / neighbors.shape[0]
+    plain = np.transpose(neighbors - average)
+    cov = np.cov(plain)
+    e_val, e_vect = eigh(cov, overwrite_a=True, overwrite_b=True)
+    normals =  e_vect[:,0]
+    sensorCenter = np.array([0,0,0])
+    p1 = sensorCenter - [x, y, z]
+    p2 = e_vect[:,0]
+    L1 = np.sqrt(p1.dot(p1))
+    L2 = np.sqrt(p2.dot(p2))
+    cos_angle = p1.dot(p2)/(L1*L2)
+    angle = np.arccos(cos_angle)
+    if ((angle > math.pi/2) | (angle < -math.pi/2)) :
+        normals =  -e_vect[:,0]
+    else:
+        normals =  e_vect[:,0]
+    return normals
+
+class image_converter:
+    def __init__(self):
+	self.bridge = CvBridge()
+
+def callback1(msg):
+    rospy.loginfo("Callback1 heard ...")
+    global inputColor
+    temp=image_converter()
+    try:
+	inputColor = temp.bridge.imgmsg_to_cv2(msg, "rgb8")
+	#inputColor = CvBridge.imgmsg_to_cv2(msg, "rgb8")
+	#inputColor = np.asarray(msg.data)
+	print(inputColor.shape)
+    except CvBridgeError as e:
+        print(e)
+    else:
+        inputColor = (np.asarray(inputColor)).astype(np.float32)/255
+	
+
+
+def callback2(msg):
+    rospy.loginfo("Callback2 heard ...")
+    global inputDepth
+    temp=image_converter()
+    try:
+        inputDepth = temp.bridge.imgmsg_to_cv2(msg, "passthrough")
+	#inputDepth = np.asarray(msg.data)
+    except CvBridgeError as e:
+        print(e)
+    else:
+        inputDepth = (np.asarray(inputDepth)).astype(np.float32)/10000
+	print(inputDepth.shape)
+
+
+def callback3(msg):
+    rospy.loginfo("Callback3 heard ...")
+    global affordanceMap
+    affordanceMap = msg.data
+    
+
+
+
+if __name__=='__main__':
+    rospy.init_node('bsp', anonymous=True)
+
+    sub_color = rospy.Subscriber("/kinect2/qhd/image_color_rect",Image,callback1)
+    sub_depth = rospy.Subscriber("/kinect2/qhd/image_depth_rect",Image,callback2)
+    sub_results = rospy.Subscriber("giveaffmap",Float32MultiArray,callback3)
+
+    pub_point = rospy.Publisher('givebsp', Int32MultiArray, queue_size=1)
+    pub_normal = rospy.Publisher('givenormal', Float32MultiArray, queue_size=1)
+
+    rate = rospy.Rate(1)
+
+    while not rospy.is_shutdown():
+        #affordanceMap = results[ 0, 1, :, : ]
+        print('im working')
+	print(affordanceMap.shape)
+        print(backgroundDepth.shape)
+        try:
+            affordanceMap = cv2.resize(affordanceMap, (img_width, img_height))
+            affordanceMap[affordanceMap >= 1] = 0.9999999
+            affordanceMap[affordanceMap < 0] = 0
+
+            foregroundMaskColor = abs(inputColor - backgroundColor) > 0.3
+            foregroundMaskColor = foregroundMaskColor[:,:,0] | foregroundMaskColor[:,:,1] | foregroundMaskColor[:,:,2]
+            foregroundMaskDepth = (backgroundDepth != 0) & (abs(inputDepth - backgroundDepth) > 0.035)
+            foregroundMask = foregroundMaskColor | foregroundMaskDepth
+
+            foregroundMask[0:200,:] = False
+
+            affordanceMap[~foregroundMask] = 0
+
+            affordanceMap2 = filters.gaussian_filter(affordanceMap, 7)
+
+            u, v = npmax(affordanceMap2)
+
+            pixX, pixY = np.meshgrid(np.arange(0,img_width), np.arange(0,img_height))
+            camX = (pixX - cameraIntrinsics[0,2]) * inputDepth/cameraIntrinsics[0, 0]
+            camY = (pixY - cameraIntrinsics[1,2]) * inputDepth/cameraIntrinsics[1,1]
+            camZ = inputDepth
+            validDepth = foregroundMask & (camZ != 0)
+            inputPoints = ( np.concatenate([camX[validDepth], camY[validDepth], camZ[validDepth]], axis = 0) ).reshape(3, -1)
+            inputPoints2 = inputPoints.T
+
+        except:
+            print "Error: Something goes wrong"
+        
+        else:
+            d = inputDepth[u, v]
+            z = d
+            x = (u - cameraIntrinsics[0,2]) * z / cameraIntrinsics[0, 0]
+            y = (v - cameraIntrinsics[1,2]) * z / cameraIntrinsics[1,1]
+
+    
+            normal = estimate_normals(inputPoints2, x, y, z, 50)
+            normal_to_pub = Float32MultiArray(data=normal)
+
+            best_suction_point = npmax(affordanceMap2)
+            point_to_pub = Int32MultiArray(data=best_suction_point)
+
+            pub_point.publish(point_to_pub)
+
+            pub_normal.publish(normal_to_pub)
+	    print(point_to_pub.data)
+
+        rate.sleep()

@@ -1,0 +1,5 @@
+int8 obj_id
+int8 state
+geometry_msgs/PoseStamped pose
+float64 theta
+
